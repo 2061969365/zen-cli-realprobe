@@ -1,0 +1,86 @@
+name: cli-real-multiturn
+
+# 官方 CLI（@opencode/cli@latest）真实多轮对话，6 个独立 runner = 6 个出口 IP，
+# 每个 shard 一个不同免费模型；每 shard 跑 2 轮（run + --continue）。
+# 目的：确认 429 是否与 GitHub Actions 出口 IP 绑定，而非免费层全局耗尽。
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            model: deepseek-v4.1-flash-free
+          - shard: 2
+            model: ling-3.0-flash-fin-free
+          - shard: 3
+            model: nemotron-3.5-lightning-free
+          - shard: 4
+            model: mimo-v2.6-flash-free
+          - shard: 5
+            model: longcat-2.5-preview-free
+          - shard: 6
+            model: jev-1.13-free
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: egress ip
+        run: |
+          curl -s -m 20 http://ip-api.com/json | python3 -c 'import json,sys; j=json.load(sys.stdin); print("SHARD=${{ matrix.shard }} MODEL=${{ matrix.model }} IP=", j.get("query"), j.get("countryCode",""), j.get("isp",""), j.get("as",""))'
+
+      - name: install cli
+        run: |
+          set -u
+          npm install -g @opencode/cli@latest >/tmp/npm.log 2>&1 || { echo "CLI_INSTALL_FAIL"; tail -20 /tmp/npm.log; exit 0; }
+          echo "CLI_VERSION=$(opencode --version 2>&1 | head -1)"
+          echo "NPM_VIEW=$(npm view @opencode/cli version 2>&1 | head -1)"
+          echo "AUTH_LIST_START"
+          opencode auth list 2>&1 | head -20
+          echo "AUTH_LIST_END"
+
+      - name: turn1 real conversation
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          NO_COLOR: "1"
+        run: |
+          set -u
+          set +e
+          out=$(timeout 150 opencode run -m "opencode/${{ matrix.model }}" "你好，请用一句话说明你能做什么。只回复这一句。" 2>&1)
+          rc=$?
+          set -e
+          clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+          echo "T1 model=${{ matrix.model }} rc=$rc chars=${#clean}"
+          echo "T1_TAIL=$(printf '%s' "$clean" | tail -4 | tr '\n' '|' | head -c 400)"
+          echo "T1_429=$(printf '%s' "$clean" | grep -c 'FreeUsageLimitError\|Free usage limit' || true)"
+          printf '%s' "$clean" > /tmp/t1.txt
+
+      - name: turn2 continue same session
+        env:
+          OPENCODE_DISABLE_AUTOUPDATE: "1"
+          NO_COLOR: "1"
+        run: |
+          set -u
+          set +e
+          out=$(timeout 150 opencode run --continue "请复述你上一句回答的前半句，不要展开。" 2>&1)
+          rc=$?
+          set -e
+          clean=$(printf '%s' "$out" | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g')
+          echo "T2 model=${{ matrix.model }} rc=$rc chars=${#clean}"
+          echo "T2_TAIL=$(printf '%s' "$clean" | tail -4 | tr '\n' '|' | head -c 400)"
+          echo "T2_429=$(printf '%s' "$clean" | grep -c 'FreeUsageLimitError\|Free usage limit' || true)"
+          printf '%s' "$clean" > /tmp/t2.txt
+
+      - name: verdict
+        if: always()
+        run: |
+          t1=$(cat /tmp/t1.txt 2>/dev/null | tr '\n' '|' | head -c 500)
+          t2=$(cat /tmp/t2.txt 2>/dev/null | tr '\n' '|' | head -c 500)
+          {
+            echo "### shard ${{ matrix.shard }} / ${{ matrix.model }}"
+            echo "- turn1: \`$t1\`"
+            echo "- turn2: \`$t2\`"
+            echo "- 429_hits: $(printf '%s%s' "$t1" "$t2" | grep -c 'FreeUsageLimitError\|Free usage limit' || true)"
+          } >> "$GITHUB_STEP_SUMMARY"
