@@ -1,0 +1,59 @@
+name: azure-ipv6-test
+
+# 测试 GitHub Actions 自带的 Azure 虚拟机是否支持/能够开启 IPv6
+on:
+  workflow_dispatch:
+
+jobs:
+  test-ipv6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 1. Check default interfaces and IPv6 config
+        run: |
+          echo "=== IP Addr ==="
+          ip addr
+          echo "=== IPv6 Routes ==="
+          ip -6 route
+          echo "=== Sysctl IPv6 Settings ==="
+          sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.eth0.disable_ipv6 || true
+
+      - name: 2. Test native IPv6 outbound connectivity
+        run: |
+          echo "=== Testing curl -6 ==="
+          set +e
+          res=$(curl -6 -s -m 10 https://api6.ipify.org 2>&1); rc=$?
+          echo "api6.ipify.org rc=$rc output=$res"
+          res=$(curl -6 -s -m 10 https://opencode.ai/ 2>&1); rc=$?
+          echo "opencode.ai rc=$rc output=${res:0:80}"
+          res=$(curl -6 -s -m 10 https://cloudflare.com/cdn-cgi/trace 2>&1); rc=$?
+          echo "cloudflare trace rc=$rc output=${res:0:80}"
+
+      - name: 3. Attempt to request IPv6 from Azure (DHCPv6 / SLAAC / RA)
+        run: |
+          echo "=== Attempting to enable/request IPv6 on eth0 ==="
+          set +e
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.eth0.disable_ipv6=0
+          sudo sysctl -w net.ipv6.conf.eth0.accept_ra=2
+          sudo ip link set dev eth0 up
+          echo "Trying dhclient -6 on eth0..."
+          sudo timeout 15 dhclient -6 -v eth0 || true
+          echo "=== Interface status after DHCPv6 attempt ==="
+          ip -6 addr
+          ip -6 route
+
+      - name: 4. Re-test IPv6 outbound after DHCPv6 attempt
+        run: |
+          echo "=== Re-testing IPv6 ==="
+          set +e
+          res=$(curl -6 -s -m 10 https://api6.ipify.org 2>&1); rc=$?
+          echo "api6.ipify.org rc=$rc output=$res"
+          res=$(curl -6 -s -m 10 https://opencode.ai/ 2>&1); rc=$?
+          echo "opencode.ai rc=$rc output=${res:0:80}"
+
+      - name: 5. Check Azure Metadata Service (IMDS) for network info
+        run: |
+          echo "=== Azure Instance Metadata Service Network Info ==="
+          curl -s -m 5 -H Metadata:true --noproxy "*" "http://169.254.169.254/metadata/instance/network?api-version=2021-02-01" | python3 -m json.tool || true
